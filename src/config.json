@@ -1,0 +1,7 @@
+{
+    "hidden_sizes": [64],
+    "rho": [0.95],
+    "num_kv_pairs": 32,
+    "num_overwrites": 2,
+    "seq_len": 256
+}

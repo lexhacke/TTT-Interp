@@ -19,7 +19,7 @@ class TTTConfig:
     ttt_inner_lr: float = 1.0
     mini_batch_size: int = 64
     ffn_mult: int = 4
-    ttt_hidden_mult: int = 4      # MLP inner model: dh = ttt_hidden_mult * head_dim
+    ttt_hidden_mult: float = 4.0   # MLP inner model: dh = ttt_hidden_mult * head_dim
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     backbone_type: str = "linear"  # "linear" | "mlp" | "mlp_frozen_phi"
@@ -156,35 +156,58 @@ class TTTLinear(TTTBackbone):
 
 
 class TTTMLP(TTTBackbone):
-    """Inner model: f(x) = ReLU(x @ W0^T) @ W1^T    (two-layer MLP, no bias)
+    """Inner model: f(x) = x + RMSNorm(ReLU(x @ W0^T) @ W1^T)
 
-    All params (W0 and W1) update at every token — this means the ReLU mask
-    changes across tokens, so there's no clean dual form. We loop sequentially.
+    Prenorm residual MLP with RMSNorm for stability (per TTT paper §2.3).
+    All params (W0 and W1) update at every token. RMSNorm weights are frozen
+    during the inner loop (trained by outer loop only).
 
     For each token i in the chunk:
       FORWARD on key k_i:
-        h_i  = k_i @ W0^T              # pre-activation     [B, nh, 1, dh]
-        a_i  = ReLU(h_i)               # post-activation    [B, nh, 1, dh]
-        z_i  = a_i @ W1^T              # prediction of v_i  [B, nh, 1, dv]
+        h_i  = k_i @ W0^T                      # [B, nh, 1, dh]
+        a_i  = ReLU(h_i)                        # [B, nh, 1, dh]
+        r_i  = a_i @ W1^T                       # [B, nh, 1, dk]
+        z_i  = k_i + RMSNorm(r_i)               # residual + norm
 
-      BACKWARD (manual grad of MSE = ||z_i - v_i||^2):
-        dz_i = 2(z_i - v_i)            # dL/dz              [B, nh, 1, dv]
-        dW1  = dz_i^T @ a_i            # dL/dW1             [B, nh, dv, dh]
-        da_i = dz_i @ W1               # dL/da (chain rule) [B, nh, 1, dh]
-        dW0  = (da_i * mask_i)^T @ k_i # dL/dW0 (thru ReLU) [B, nh, dh, dk]
+      BACKWARD (manual grad of ||z_i - v_i||^2, chain through norm + residual):
+        dz_i = 2(z_i - v_i)
+        dr_i = dz_i ⊙ d(RMSNorm)/d(r_i)       # chain through RMSNorm
+        dW1  = dr_i^T @ a_i
+        da_i = dr_i @ W1
+        dW0  = (da_i * mask_i)^T @ k_i
 
-      SGD STEP:
-        W0 = W0 - eta * dW0
-        W1 = W1 - eta * dW1
+      SGD STEP: W0 -= eta * dW0, W1 -= eta * dW1
 
-      EVALUATE on query q_i (using the UPDATED weights):
-        o_i = ReLU(q_i @ W0^T) @ W1^T  # this is the layer's output for token i
+      EVALUATE on query q_i (updated weights):
+        o_i = q_i + RMSNorm(ReLU(q_i @ W0^T) @ W1^T)
     """
 
     def __init__(self, num_heads: int, head_dim: int, hidden_dim: int):
         super().__init__()
         self.W0 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, hidden_dim, head_dim)))
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, head_dim, hidden_dim)))
+        # RMSNorm weights: per-head, frozen during inner loop
+        self.norm_weight = nn.Parameter(torch.ones(num_heads, 1, head_dim))
+        self.norm_eps = 1e-6
+
+    def _rms_norm(self, x):
+        """x: [B, nh, 1, dk]. Uses self.norm_weight [nh, 1, dk] (broadcast over B)."""
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.norm_eps)
+        return (x.float() * rms).to(x.dtype) * self.norm_weight
+
+    def _rms_norm_backward(self, x, grad_out):
+        """Manual backward for RMSNorm: d(loss)/d(x) given d(loss)/d(norm(x)).
+        x, grad_out: [B, nh, 1, dk]
+        """
+        dk = x.shape[-1]
+        x_f = x.float()
+        rms_inv = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.norm_eps)
+        x_hat = x_f * rms_inv
+        # grad through norm_weight * x_hat
+        grad_xhat = (grad_out.float() * self.norm_weight)
+        # grad through x_hat = x * rms_inv
+        grad_x = rms_inv * (grad_xhat - x_hat * (grad_xhat * x_hat).mean(-1, keepdim=True))
+        return grad_x.to(x.dtype)
 
     def init_fast_weights(self, B, device):
         return {
@@ -194,7 +217,7 @@ class TTTMLP(TTTBackbone):
 
     def compute_mini_batch(self, params, XQ, XK, XV, eta):
         W0 = params["W0"]                                # [B, nh, dh, dk]
-        W1 = params["W1"]                                # [B, nh, dv, dh]
+        W1 = params["W1"]                                # [B, nh, dk, dh]
         K_len = XK.shape[-2]
         outputs = []
         masks = []
@@ -204,17 +227,20 @@ class TTTMLP(TTTBackbone):
             v_i = XV[:, :, i : i + 1, :]                  # [B, nh, 1, dv]
             q_i = XQ[:, :, i : i + 1, :]                  # [B, nh, 1, dk]
 
-            # ── forward on key ──
+            # ── forward on key: f(k) = k + RMSNorm(ReLU(k @ W0^T) @ W1^T) ──
             h_i = k_i @ W0.transpose(-1, -2)              # [B, nh, 1, dh]
             mask_i = (h_i > 0)
             a_i = h_i * mask_i                             # ReLU
-            z_i = a_i @ W1.transpose(-1, -2)               # [B, nh, 1, dv]
+            r_i = a_i @ W1.transpose(-1, -2)               # [B, nh, 1, dk]
+            z_i = k_i + self._rms_norm(r_i)                # residual + norm
 
             # ── backward: manual grad of ||z_i - v_i||^2 ──
-            dz_i = 2.0 * (z_i - v_i)                      # dL/dz
-            dW1 = dz_i.transpose(-1, -2) @ a_i            # dL/dW1
-            da_i = dz_i @ W1                               # dL/da (chain thru W1)
-            dW0 = (da_i * mask_i).transpose(-1, -2) @ k_i # dL/dW0 (chain thru ReLU)
+            dz_i = 2.0 * (z_i - v_i)                      # dL/dz  [B, nh, 1, dk]
+            # chain through residual: dL/dr = dL/dz ⊙ d(RMSNorm)/dr
+            dr_i = self._rms_norm_backward(r_i, dz_i)     # dL/dr  [B, nh, 1, dk]
+            dW1 = dr_i.transpose(-1, -2) @ a_i            # dL/dW1 [B, nh, dk, dh]
+            da_i = dr_i @ W1                               # dL/da  [B, nh, 1, dh]
+            dW0 = (da_i * mask_i).transpose(-1, -2) @ k_i # dL/dW0 [B, nh, dh, dk]
 
             # ── SGD step ──
             W0 = W0 - eta * dW0
@@ -222,36 +248,51 @@ class TTTMLP(TTTBackbone):
 
             # ── evaluate on query (using UPDATED W0, W1) ──
             h_q = q_i @ W0.transpose(-1, -2)
-            outputs.append(F.relu(h_q) @ W1.transpose(-1, -2))
+            o_i = q_i + self._rms_norm(F.relu(h_q) @ W1.transpose(-1, -2))
+            outputs.append(o_i)
             masks.append(mask_i)
 
         return TTTOutput(params={"W0": W0, "W1": W1}, output=torch.cat(outputs, dim=-2), masks=torch.cat(masks, dim=-2))
 
 
 class TTTMLPFrozenPhi(TTTBackbone):
-    """Inner model: f(x) = ReLU(x @ W0^T) @ W1^T    (two-layer MLP, no bias)
+    """Inner model: f(x) = x + RMSNorm(ReLU(x @ W0^T) @ W1^T)
 
     ONLY W1 updates. W0 is frozen during the inner loop (still trained by outer loop).
-    This is "Variant 1" from the NVIDIA paper — it actually performs BETTER than
-    updating all params, and admits a clean dual form because the ReLU masks are
-    fixed (W0 doesn't change, so ReLU(x @ W0^T) is the same regardless of token order).
+    This is "Variant 1" from the NVIDIA paper. Admits a dual form because the ReLU masks
+    are fixed (W0 doesn't change).
 
-    Dual form derivation:
-      A_K = ReLU(XK @ W0^T)                # activations for keys   [B, nh, K, dh]
-      A_Q = ReLU(XQ @ W0^T)                # activations for queries [B, nh, K, dh]
-      Z   = A_K @ W1^T                     # predictions            [B, nh, K, dv]
-      dZ  = 2(Z - XV)                      # MSE gradients          [B, nh, K, dv]
-      Attn = tril(A_Q @ A_K^T)             # attention in activation space
-      O   = A_Q @ W1^T - eta * Attn @ dZ   # output with gradient corrections
-      W1_new = W1 - eta * (dZ^T @ A_K)     # carry to next chunk
+    The residual + RMSNorm wraps the MLP output, matching the full MLP backbone.
+    Since RMSNorm weights are frozen during the inner loop and the norm is applied
+    per-token, it factors through the dual form cleanly:
 
-    Same dual-form approximation as TTTLinear, just in the activation space of ReLU(x @ W0^T).
+      A_K = ReLU(XK @ W0^T)
+      A_Q = ReLU(XQ @ W0^T)
+      R   = A_K @ W1^T                      # raw MLP output
+      Z   = XK + RMSNorm(R)                 # with residual + norm
+      dZ  = 2(Z - XV)
+      dR  = dZ ⊙ d(RMSNorm)/dR             # chain through norm
+      ... standard dual form on dR ...
     """
 
     def __init__(self, num_heads: int, head_dim: int, hidden_dim: int):
         super().__init__()
         self.W0 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, hidden_dim, head_dim)))
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, head_dim, hidden_dim)))
+        self.norm_weight = nn.Parameter(torch.ones(num_heads, 1, head_dim))
+        self.norm_eps = 1e-6
+
+    def _rms_norm(self, x):
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.norm_eps)
+        return (x.float() * rms).to(x.dtype) * self.norm_weight
+
+    def _rms_norm_backward(self, x, grad_out):
+        x_f = x.float()
+        rms_inv = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.norm_eps)
+        x_hat = x_f * rms_inv
+        grad_xhat = grad_out.float() * self.norm_weight
+        grad_x = rms_inv * (grad_xhat - x_hat * (grad_xhat * x_hat).mean(-1, keepdim=True))
+        return grad_x.to(x.dtype)
 
     def init_fast_weights(self, B, device):
         return {"W1": self.W1.unsqueeze(0).expand(B, -1, -1, -1).clone()}
@@ -260,18 +301,22 @@ class TTTMLPFrozenPhi(TTTBackbone):
         W0 = self.W0                                      # [nh, dh, dk] frozen
         W1 = params["W1"]                                  # [B, nh, dv, dh]
 
-        # Fixed activations (W0 doesn't change, so these are the same at every token)
         A_K = F.relu(XK @ W0.transpose(-1, -2))           # [B, nh, K, dh]
         A_Q = F.relu(XQ @ W0.transpose(-1, -2))           # [B, nh, K, dh]
 
-        # Forward all keys, compute MSE gradient
-        Z = A_K @ W1.transpose(-1, -2)                    # [B, nh, K, dv]
+        # Forward: f(x) = x + RMSNorm(A_K @ W1^T)
+        R_K = A_K @ W1.transpose(-1, -2)                  # [B, nh, K, dk]
+        Z = XK + self._rms_norm(R_K)
         dZ = 2.0 * (Z - XV)
 
-        # Dual form: attention in activation space, not raw key space
+        # Chain through RMSNorm (per-token, so applies elementwise across K)
+        dR = self._rms_norm_backward(R_K, dZ)             # [B, nh, K, dk]
+
+        # Dual form on dR (same as before but with dR instead of dZ)
         Attn = torch.tril(A_Q @ A_K.transpose(-1, -2))   # [B, nh, K, K]
-        O = A_Q @ W1.transpose(-1, -2) - eta * Attn @ dZ
-        W1_new = W1 - eta * (dZ.transpose(-1, -2) @ A_K)
+        R_Q = A_Q @ W1.transpose(-1, -2)                  # [B, nh, K, dk]
+        O = XQ + self._rms_norm(R_Q - eta * Attn @ dR)
+        W1_new = W1 - eta * (dR.transpose(-1, -2) @ A_K)
         return TTTOutput(params={"W1": W1_new}, output=O)
 
 
@@ -364,7 +409,7 @@ class FeedForward(nn.Module):
 
 def _make_backbone(config: TTTConfig) -> TTTBackbone:
     nh, dk = config.num_heads, config.head_dim
-    dh = dk * config.ttt_hidden_mult
+    dh = int(dk * config.ttt_hidden_mult)
     if config.backbone_type == "linear":
         return TTTLinear(nh, dk)
     if config.backbone_type == "mlp":

@@ -90,19 +90,39 @@ def make_clustered_mqar(
     num_examples: int,
     input_seq_len: int = 128,
     num_kv_pairs: int = 8,
+    num_overwrites: int = 0,
     num_value_tokens: int = 4096,
     seed: int = 0,
     power_a: float = 0.01,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate clustered MQAR with optional overwrites.
+
+    Sequence format (num_overwrites=0):
+        [K1 V1 K2 V2 ... | padding ... | K_query _ ... K_query _ ...]
+
+    Sequence format (num_overwrites>0):
+        [K1 V1 ... KN VN | Ko1 Vo1' Ko2 Vo2' | padding ... | queries ...]
+        The first num_overwrites keys are re-written with new values right after
+        the initial KV context.
+
+    Returns:
+        inputs:       [num_examples, input_seq_len]  token IDs
+        labels:       [num_examples, input_seq_len]  -100 at non-query positions
+        overwrite_mask: [num_examples, num_kv_pairs]  bool — True for overwritten keys
+    """
     num_keys = codebook.shape[0]
     vocab_size = num_keys + num_value_tokens
 
     assert input_seq_len % 2 == 0
-    assert num_kv_pairs * 4 <= input_seq_len
+    assert num_overwrites < num_kv_pairs
+    context_size = num_kv_pairs * 2
+    overwrite_size = num_overwrites * 2
+    total_context = context_size + overwrite_size
+    assert total_context * 2 <= input_seq_len  # room for queries
 
     np.random.seed(seed)
-    context_size = num_kv_pairs * 2
 
+    # sample keys and original values
     keys = np.stack([
         np.random.choice(num_keys, size=num_kv_pairs, replace=False)
         for _ in range(num_examples)
@@ -112,11 +132,32 @@ def make_clustered_mqar(
         for _ in range(num_examples)
     ])
 
-    kvs = np.zeros((num_examples, context_size), dtype=np.int64)
-    kvs[:, 0::2] = keys
-    kvs[:, 1::2] = values
+    # build overwrite: re-use first num_overwrites keys with NEW values
+    overwrite_mask = np.zeros((num_examples, num_kv_pairs), dtype=bool)
+    if num_overwrites > 0:
+        overwrite_mask[:, :num_overwrites] = True
+        new_values = np.stack([
+            np.random.choice(np.arange(num_keys, vocab_size), size=num_overwrites, replace=False)
+            for _ in range(num_examples)
+        ])
+        # effective values: overwritten keys get new_values, rest keep original
+        effective_values = values.copy()
+        effective_values[:, :num_overwrites] = new_values
+    else:
+        new_values = None
+        effective_values = values
 
-    space = (input_seq_len - context_size) // 2
+    # build context: [K1 V1 K2 V2 ... | Ko1 Vo1' Ko2 Vo2' ]
+    kvs = np.zeros((num_examples, total_context), dtype=np.int64)
+    kvs[:, 0:context_size:2] = keys
+    kvs[:, 1:context_size:2] = values
+    if num_overwrites > 0:
+        kvs[:, context_size + 0::2] = keys[:, :num_overwrites]
+        kvs[:, context_size + 1::2] = new_values
+
+    # power-law query placement in the second half
+    query_space_len = input_seq_len - total_context
+    space = query_space_len // 2
     p = power_a * np.arange(1, space + 1) ** (power_a - 1)
     p = p / p.sum()
     gaps = np.stack([
@@ -124,12 +165,14 @@ def make_clustered_mqar(
         for _ in range(num_examples)
     ])
 
-    queries = np.zeros((num_examples, input_seq_len - context_size + 1), dtype=np.int64)
+    queries = np.zeros((num_examples, query_space_len + 1), dtype=np.int64)
     np.put_along_axis(queries, gaps * 2, values=keys, axis=1)
 
     examples = np.concatenate([kvs, queries], axis=1)
+
+    # labels: effective_values (new value for overwritten, original for rest)
     labels = np.full((num_examples, input_seq_len + 1), -100, dtype=np.int64)
-    np.put_along_axis(labels, gaps * 2 + context_size + 1, values=values, axis=1)
+    np.put_along_axis(labels, gaps * 2 + total_context + 1, values=effective_values, axis=1)
 
     inputs = torch.tensor(examples[:, :-1])
     labels = torch.tensor(labels[:, 1:])
@@ -137,7 +180,7 @@ def make_clustered_mqar(
     pad_mask = inputs == 0
     inputs[pad_mask] = torch.randint(num_keys, vocab_size, size=inputs.shape)[pad_mask]
 
-    return inputs, labels
+    return inputs, labels, torch.tensor(overwrite_mask)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -153,6 +196,7 @@ class MQARDataModule(L.LightningDataModule):
         num_test: int = 3_000,
         seq_len: int = 128,
         num_kv_pairs: int = 8,
+        num_overwrites: int = 0,
         num_value_tokens: int = 4096,
         batch_size: int = 64,
         num_workers: int = 4,
@@ -164,18 +208,18 @@ class MQARDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         hp = self.hparams
-        self.train_x, self.train_y = make_clustered_mqar(
+        self.train_x, self.train_y, self.train_ow = make_clustered_mqar(
             self.codebook, self.cluster_ids, hp.num_train,
-            hp.seq_len, hp.num_kv_pairs, hp.num_value_tokens, seed=0,
+            hp.seq_len, hp.num_kv_pairs, hp.num_overwrites, hp.num_value_tokens, seed=0,
         )
-        self.test_x, self.test_y = make_clustered_mqar(
+        self.test_x, self.test_y, self.test_ow = make_clustered_mqar(
             self.codebook, self.cluster_ids, hp.num_test,
-            hp.seq_len, hp.num_kv_pairs, hp.num_value_tokens, seed=1,
+            hp.seq_len, hp.num_kv_pairs, hp.num_overwrites, hp.num_value_tokens, seed=1,
         )
 
     def train_dataloader(self):
         return DataLoader(
-            TensorDataset(self.train_x, self.train_y),
+            TensorDataset(self.train_x, self.train_y, self.train_ow),
             batch_size=self.hparams.batch_size, shuffle=True,
             drop_last=True, num_workers=self.hparams.num_workers,
             persistent_workers=self.hparams.num_workers > 0,
@@ -183,7 +227,7 @@ class MQARDataModule(L.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(
-            TensorDataset(self.test_x, self.test_y),
+            TensorDataset(self.test_x, self.test_y, self.test_ow),
             batch_size=self.hparams.batch_size, shuffle=False,
             drop_last=False, num_workers=self.hparams.num_workers,
             persistent_workers=self.hparams.num_workers > 0,
@@ -230,26 +274,47 @@ class TTTLitModel(L.LightningModule):
         return self.model(input_ids)
 
     def _shared_step(self, batch):
-        x, y = batch
+        x, y, ow_mask = batch  # ow_mask: [B, num_kv_pairs] bool
         logits, _ = self.model(x)
         loss = F.cross_entropy(
             logits.view(-1, self.config.vocab_size), y.view(-1), ignore_index=-100,
         )
         # accuracy on query positions only
-        mask = y != -100
-        acc = (logits.argmax(-1)[mask] == y[mask]).float().mean() if mask.any() else torch.tensor(0.0)
-        return loss, acc
+        query_mask = y != -100
+        preds = logits.argmax(-1)
+        acc = (preds[query_mask] == y[query_mask]).float().mean() if query_mask.any() else torch.tensor(0.0)
+        return loss, acc, preds, y, ow_mask
 
     def training_step(self, batch, batch_idx):
-        loss, acc = self._shared_step(batch)
+        loss, acc, _, _, _ = self._shared_step(batch)
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/acc", acc, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, acc = self._shared_step(batch)
+        loss, acc, preds, y, ow_mask = self._shared_step(batch)
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
         self.log("val/acc", acc, prog_bar=True, sync_dist=True)
+
+        # stratified accuracy when overwrites are present
+        if ow_mask.any():
+            num_kv = ow_mask.shape[1]
+            # query positions correspond to kv-pair indices — labels are placed
+            # at power-law gaps, but we can identify overwrite vs retained by
+            # checking which query positions have labels matching overwritten keys.
+            # Simpler: use the ow_mask to index into the per-query results.
+            # Query answers appear in label order matching kv-pair order,
+            # so we collect per-query correctness and split by ow_mask.
+            query_mask = y != -100
+            correct = (preds == y)  # [B, L]
+            # extract only query positions: B x num_kv_pairs
+            query_correct = correct[query_mask].view(-1, num_kv)  # [B, num_kv]
+            ow = ow_mask[:query_correct.shape[0]]  # align batch dim
+            if ow.any():
+                self.log("val/overwrite_acc", query_correct[ow].float().mean(), sync_dist=True)
+            retained = ~ow
+            if retained.any():
+                self.log("val/retained_acc", query_correct[retained].float().mean(), sync_dist=True)
 
     def on_validation_epoch_end(self):
         # mechanistic eval every validation epoch
@@ -366,7 +431,7 @@ def main():
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--mini-batch-size", type=int, default=16)
     p.add_argument("--inner-lr", type=float, default=1.0)
-    p.add_argument("--ttt-hidden-mult", type=int, default=4)
+    p.add_argument("--ttt-hidden-mult", type=float, default=0.5)
 
     # data
     p.add_argument("--rho", type=float, default=0.8)
@@ -374,6 +439,7 @@ def main():
     p.add_argument("--keys-per-cluster", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--kv-pairs", type=int, default=8)
+    p.add_argument("--num-overwrites", type=int, default=0)
     p.add_argument("--num-train", type=int, default=100_000)
     p.add_argument("--num-test", type=int, default=3_000)
     p.add_argument("--num-value-tokens", type=int, default=4096)
@@ -398,7 +464,7 @@ def main():
         codebook=codebook, cluster_ids=cluster_ids,
         num_train=args.num_train, num_test=args.num_test,
         seq_len=args.seq_len, num_kv_pairs=args.kv_pairs,
-        num_value_tokens=args.num_value_tokens,
+        num_overwrites=args.num_overwrites, num_value_tokens=args.num_value_tokens,
         batch_size=args.batch_size, num_workers=args.num_workers,
     )
 
@@ -437,7 +503,7 @@ def main():
         logger=logger,
         callbacks=callbacks,
         gradient_clip_val=1.0,
-        precision="bf16-mixed",
+        precision="32-true",
         check_val_every_n_epoch=1,
         enable_progress_bar=True,
     )
