@@ -23,6 +23,7 @@ class TTTConfig:
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     backbone_type: str = "linear"  # "linear" | "mlp" | "mlp_frozen_phi"
+    num_inner_steps: int = 1        # number of passes over each mini-batch chunk
 
     @property
     def head_dim(self):
@@ -105,7 +106,7 @@ class TTTBackbone(ABC, nn.Module):
         XQ: torch.Tensor,
         XK: torch.Tensor,
         XV: torch.Tensor,
-        eta: float,
+        eta: torch.Tensor | float,
     ) -> TTTOutput:
         """Process one mini-batch. Returns (updated_params, output [B, nh, K, dv])."""
 
@@ -142,72 +143,87 @@ class TTTLinear(TTTBackbone):
         # 1) Forward all keys: predict v from k
         Z = XK @ W.transpose(-1, -2)                     # [B, nh, K, hd]
 
-        # 2) MSE gradient: dL/dz = 2(z - v) for each token
+        # 2) MSE gradient: dL/dz = 2(z - v)
         dZ = 2.0 * (Z - XV)
 
         # 3) Dual form output: query i accumulates gradient corrections from tokens j <= i
-        #    Attn[i,j] = dot(q_i, k_j) — how much token j's gradient affects token i's output
+        #    eta is [B, nh, K, 1] — scales each token's contribution
         Attn = torch.tril(XQ @ XK.transpose(-1, -2))     # [B, nh, K, K]
-        O = XQ @ W.transpose(-1, -2) - eta * Attn @ dZ
+        O = XQ @ W.transpose(-1, -2) - (eta * Attn) @ dZ
 
-        # 4) Update W for next chunk: apply all K tokens' gradients
-        W_new = W - eta * (dZ.transpose(-1, -2) @ XK)
+        # 4) Update W for next chunk: use last token's eta (accumulates all prior updates)
+        eta_last = eta[:, :, -1:, :] if isinstance(eta, torch.Tensor) else eta
+        W_new = W - eta_last * (dZ.transpose(-1, -2) @ XK)
         return TTTOutput(params={"W": W_new}, output=O)
 
 
+def _rms_norm_fwd(x, weight, eps=1e-6):
+    """RMSNorm forward: y = (x / rms) * weight."""
+    rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    return (x.float() * rms).to(x.dtype) * weight
+
+
+def _rms_norm_fused_l2_bwd(x, l2_target, weight, eps=1e-6):
+    """Fused RMSNorm + L2 loss backward: dL/dx for loss = ||RMSNorm(x) - target||^2.
+
+    Adapted from ttt-reference.py ln_fused_l2_bwd, but without mean-centering (RMS not LN).
+    """
+    D = x.shape[-1]
+    x_f = x.float()
+    rms_inv = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+    x_hat = x_f * rms_inv
+
+    # forward: y = weight * x_hat
+    y = weight * x_hat
+    # L2 grad: dL/dy = 2(y - target)
+    grad_output = 2.0 * (y - l2_target)
+    # chain through weight: dL/d(x_hat) = grad_output * weight
+    grad_x_hat = grad_output.float() * weight
+
+    # chain through x_hat = x * rms_inv (no mean subtraction unlike LN)
+    z = (
+        (1.0 / D)
+        * (
+            D * grad_x_hat
+            - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
+        )
+        * rms_inv
+    )
+    return z.to(x.dtype)
+
+
+def _silu_bwd(x):
+    """Derivative of SiLU: d/dx [x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x)))."""
+    sig = torch.sigmoid(x)
+    return sig * (1.0 + x * (1.0 - sig))
+
+
 class TTTMLP(TTTBackbone):
-    """Inner model: f(x) = x + RMSNorm(ReLU(x @ W0^T) @ W1^T)
+    """Inner model: f(x) = x + RMSNorm(SiLU(x @ W0^T) @ W1^T)
 
-    Prenorm residual MLP with RMSNorm for stability (per TTT paper §2.3).
-    All params (W0 and W1) update at every token. RMSNorm weights are frozen
-    during the inner loop (trained by outer loop only).
+    SiLU (Swish) activation — smooth, differentiable everywhere. Enables stable
+    multi-step inner optimization without the chaotic gradient landscape of ReLU.
 
-    For each token i in the chunk:
-      FORWARD on key k_i:
-        h_i  = k_i @ W0^T                      # [B, nh, 1, dh]
-        a_i  = ReLU(h_i)                        # [B, nh, 1, dh]
-        r_i  = a_i @ W1^T                       # [B, nh, 1, dk]
-        z_i  = k_i + RMSNorm(r_i)               # residual + norm
+    For each token i:
+      FORWARD:  r_i = SiLU(k_i @ W0^T) @ W1^T           (raw MLP output)
+                z_i = k_i + RMSNorm(r_i)                  (output with residual)
 
-      BACKWARD (manual grad of ||z_i - v_i||^2, chain through norm + residual):
-        dz_i = 2(z_i - v_i)
-        dr_i = dz_i ⊙ d(RMSNorm)/d(r_i)       # chain through RMSNorm
-        dW1  = dr_i^T @ a_i
-        da_i = dr_i @ W1
-        dW0  = (da_i * mask_i)^T @ k_i
+      LOSS:     L = ||RMSNorm(r_i) - (v_i - k_i)||^2
 
-      SGD STEP: W0 -= eta * dW0, W1 -= eta * dW1
+      BACKWARD: dr_i = rms_norm_fused_l2_bwd(r_i, v_i - k_i, weight)
+                dW1 = dr_i^T @ a_i
+                da_i = dr_i @ W1
+                dW0 = (da_i * silu'(h_i))^T @ k_i         (smooth derivative)
 
-      EVALUATE on query q_i (updated weights):
-        o_i = q_i + RMSNorm(ReLU(q_i @ W0^T) @ W1^T)
+      EVAL:     o_i = q_i + RMSNorm(SiLU(q_i @ W0^T) @ W1^T)
     """
 
     def __init__(self, num_heads: int, head_dim: int, hidden_dim: int):
         super().__init__()
         self.W0 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, hidden_dim, head_dim)))
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, head_dim, hidden_dim)))
-        # RMSNorm weights: per-head, frozen during inner loop
         self.norm_weight = nn.Parameter(torch.ones(num_heads, 1, head_dim))
         self.norm_eps = 1e-6
-
-    def _rms_norm(self, x):
-        """x: [B, nh, 1, dk]. Uses self.norm_weight [nh, 1, dk] (broadcast over B)."""
-        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.norm_eps)
-        return (x.float() * rms).to(x.dtype) * self.norm_weight
-
-    def _rms_norm_backward(self, x, grad_out):
-        """Manual backward for RMSNorm: d(loss)/d(x) given d(loss)/d(norm(x)).
-        x, grad_out: [B, nh, 1, dk]
-        """
-        dk = x.shape[-1]
-        x_f = x.float()
-        rms_inv = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.norm_eps)
-        x_hat = x_f * rms_inv
-        # grad through norm_weight * x_hat
-        grad_xhat = (grad_out.float() * self.norm_weight)
-        # grad through x_hat = x * rms_inv
-        grad_x = rms_inv * (grad_xhat - x_hat * (grad_xhat * x_hat).mean(-1, keepdim=True))
-        return grad_x.to(x.dtype)
 
     def init_fast_weights(self, B, device):
         return {
@@ -219,60 +235,44 @@ class TTTMLP(TTTBackbone):
         W0 = params["W0"]                                # [B, nh, dh, dk]
         W1 = params["W1"]                                # [B, nh, dk, dh]
         K_len = XK.shape[-2]
-        outputs = []
-        masks = []
 
+        # ── Phase 1: accumulate gradients over chunk (all at initial W) ──
+        dW0_acc = torch.zeros_like(W0)
+        dW1_acc = torch.zeros_like(W1)
         for i in range(K_len):
             k_i = XK[:, :, i : i + 1, :]                 # [B, nh, 1, dk]
             v_i = XV[:, :, i : i + 1, :]                  # [B, nh, 1, dv]
-            q_i = XQ[:, :, i : i + 1, :]                  # [B, nh, 1, dk]
+            eta_i = eta[:, :, i : i + 1, :] if isinstance(eta, torch.Tensor) else eta
 
-            # ── forward on key: f(k) = k + RMSNorm(ReLU(k @ W0^T) @ W1^T) ──
             h_i = k_i @ W0.transpose(-1, -2)              # [B, nh, 1, dh]
-            mask_i = (h_i > 0)
-            a_i = h_i * mask_i                             # ReLU
+            a_i = F.silu(h_i)                              # SiLU activation
             r_i = a_i @ W1.transpose(-1, -2)               # [B, nh, 1, dk]
-            z_i = k_i + self._rms_norm(r_i)                # residual + norm
 
-            # ── backward: manual grad of ||z_i - v_i||^2 ──
-            dz_i = 2.0 * (z_i - v_i)                      # dL/dz  [B, nh, 1, dk]
-            # chain through residual: dL/dr = dL/dz ⊙ d(RMSNorm)/dr
-            dr_i = self._rms_norm_backward(r_i, dz_i)     # dL/dr  [B, nh, 1, dk]
-            dW1 = dr_i.transpose(-1, -2) @ a_i            # dL/dW1 [B, nh, dk, dh]
-            da_i = dr_i @ W1                               # dL/da  [B, nh, 1, dh]
-            dW0 = (da_i * mask_i).transpose(-1, -2) @ k_i # dL/dW0 [B, nh, dh, dk]
+            target_i = v_i - k_i
+            dr_i = _rms_norm_fused_l2_bwd(r_i, target_i, self.norm_weight, self.norm_eps)
+            dW1_acc = dW1_acc + eta_i * (dr_i.transpose(-1, -2) @ a_i)
+            da_i = dr_i @ W1
+            dW0_acc = dW0_acc + eta_i * ((da_i * _silu_bwd(h_i)).transpose(-1, -2) @ k_i)
 
-            # ── SGD step ──
-            W0 = W0 - eta * dW0
-            W1 = W1 - eta * dW1
+        # ── Phase 2: apply accumulated gradient, then eval all queries ──
+        W0 = W0 - dW0_acc
+        W1 = W1 - dW1_acc
 
-            # ── evaluate on query (using UPDATED W0, W1) ──
-            h_q = q_i @ W0.transpose(-1, -2)
-            o_i = q_i + self._rms_norm(F.relu(h_q) @ W1.transpose(-1, -2))
-            outputs.append(o_i)
-            masks.append(mask_i)
+        H_Q = XQ @ W0.transpose(-1, -2)                   # [B, nh, K, dh]
+        R_Q = F.silu(H_Q) @ W1.transpose(-1, -2)          # [B, nh, K, dk]
+        O = XQ + _rms_norm_fwd(R_Q, self.norm_weight, self.norm_eps)
 
-        return TTTOutput(params={"W0": W0, "W1": W1}, output=torch.cat(outputs, dim=-2), masks=torch.cat(masks, dim=-2))
+        return TTTOutput(params={"W0": W0, "W1": W1}, output=O, masks=None)
 
 
 class TTTMLPFrozenPhi(TTTBackbone):
     """Inner model: f(x) = x + RMSNorm(ReLU(x @ W0^T) @ W1^T)
 
     ONLY W1 updates. W0 is frozen during the inner loop (still trained by outer loop).
-    This is "Variant 1" from the NVIDIA paper. Admits a dual form because the ReLU masks
-    are fixed (W0 doesn't change).
+    Uses fused RMSNorm+L2 backward matching the full MLP backbone.
 
-    The residual + RMSNorm wraps the MLP output, matching the full MLP backbone.
-    Since RMSNorm weights are frozen during the inner loop and the norm is applied
-    per-token, it factors through the dual form cleanly:
-
-      A_K = ReLU(XK @ W0^T)
-      A_Q = ReLU(XQ @ W0^T)
-      R   = A_K @ W1^T                      # raw MLP output
-      Z   = XK + RMSNorm(R)                 # with residual + norm
-      dZ  = 2(Z - XV)
-      dR  = dZ ⊙ d(RMSNorm)/dR             # chain through norm
-      ... standard dual form on dR ...
+    Loss: ||RMSNorm(A_K @ W1^T) - (XV - XK)||^2
+    Dual form operates on dR from the fused backward.
     """
 
     def __init__(self, num_heads: int, head_dim: int, hidden_dim: int):
@@ -281,18 +281,6 @@ class TTTMLPFrozenPhi(TTTBackbone):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(num_heads, head_dim, hidden_dim)))
         self.norm_weight = nn.Parameter(torch.ones(num_heads, 1, head_dim))
         self.norm_eps = 1e-6
-
-    def _rms_norm(self, x):
-        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.norm_eps)
-        return (x.float() * rms).to(x.dtype) * self.norm_weight
-
-    def _rms_norm_backward(self, x, grad_out):
-        x_f = x.float()
-        rms_inv = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.norm_eps)
-        x_hat = x_f * rms_inv
-        grad_xhat = grad_out.float() * self.norm_weight
-        grad_x = rms_inv * (grad_xhat - x_hat * (grad_xhat * x_hat).mean(-1, keepdim=True))
-        return grad_x.to(x.dtype)
 
     def init_fast_weights(self, B, device):
         return {"W1": self.W1.unsqueeze(0).expand(B, -1, -1, -1).clone()}
@@ -304,19 +292,19 @@ class TTTMLPFrozenPhi(TTTBackbone):
         A_K = F.relu(XK @ W0.transpose(-1, -2))           # [B, nh, K, dh]
         A_Q = F.relu(XQ @ W0.transpose(-1, -2))           # [B, nh, K, dh]
 
-        # Forward: f(x) = x + RMSNorm(A_K @ W1^T)
+        # Forward: raw MLP output (pre-norm)
         R_K = A_K @ W1.transpose(-1, -2)                  # [B, nh, K, dk]
-        Z = XK + self._rms_norm(R_K)
-        dZ = 2.0 * (Z - XV)
 
-        # Chain through RMSNorm (per-token, so applies elementwise across K)
-        dR = self._rms_norm_backward(R_K, dZ)             # [B, nh, K, dk]
+        # Fused RMSNorm + L2 backward, target = V - K
+        target = XV - XK
+        dR = _rms_norm_fused_l2_bwd(R_K, target, self.norm_weight, self.norm_eps)
 
-        # Dual form on dR (same as before but with dR instead of dZ)
+        # Dual form on dR
         Attn = torch.tril(A_Q @ A_K.transpose(-1, -2))   # [B, nh, K, K]
         R_Q = A_Q @ W1.transpose(-1, -2)                  # [B, nh, K, dk]
-        O = XQ + self._rms_norm(R_Q - eta * Attn @ dR)
-        W1_new = W1 - eta * (dR.transpose(-1, -2) @ A_K)
+        O = XQ + _rms_norm_fwd(R_Q - (eta * Attn) @ dR, self.norm_weight, self.norm_eps)
+        eta_last = eta[:, :, -1:, :] if isinstance(eta, torch.Tensor) else eta
+        W1_new = W1 - eta_last * (dR.transpose(-1, -2) @ A_K)
         return TTTOutput(params={"W1": W1_new}, output=O)
 
 
@@ -337,7 +325,19 @@ class TTTLayer(nn.Module):
         self.o_proj = nn.Linear(D, D, bias=False)
         self.post_norm = RMSNorm(dk)
         self.backbone = backbone
-        self.eta = config.ttt_inner_lr / dk
+        self.base_lr = config.ttt_inner_lr / dk
+
+        # Learnable eta: per-head linear projection → sigmoid → scale by base_lr
+        # Input token → eta, so each token gets its own learning rate
+        self.eta_proj = nn.Linear(D, config.num_heads, bias=True)
+        nn.init.zeros_(self.eta_proj.bias)
+        nn.init.normal_(self.eta_proj.weight, std=0.02)
+
+        # 1/i token decay: turns accumulated gradient sum into running average
+        # Without this, token 32 gets 32x the effective update of token 1
+        token_idx = 1.0 / torch.arange(1, config.mini_batch_size + 1)  # [1, 1/2, 1/3, ...]
+        self.register_buffer("token_idx", token_idx, persistent=False)
+        self.learnable_token_idx = nn.Parameter(torch.zeros(config.mini_batch_size))
 
         cos, sin = precompute_rope(dk, config.max_seq_len, config.rope_theta)
         self.rope_cos: torch.Tensor
@@ -361,30 +361,52 @@ class TTTLayer(nn.Module):
         XK = rearrange(XK, 'b nh (nm k) dk -> b nh nm k dk', k=K)
         V  = rearrange(V,  'b nh (nm k) dk -> b nh nm k dk', k=K)
 
+        # ── learnable eta: [B, L] → [B, nh, num_mb, K, 1] ──
+        ttt_lr = torch.sigmoid(self.eta_proj(x)) * self.base_lr  # [B, L, nh]
+        ttt_lr = rearrange(ttt_lr, 'b (nm k) nh -> b nh nm k 1', k=K)
+
+        # ── 1/i token decay: running average instead of running sum ──
+        token_decay = torch.clamp_min(self.token_idx + self.learnable_token_idx, 0.0)  # [K]
+        token_decay = token_decay.view(1, 1, 1, K, 1)       # broadcast over [B, nh, nm, K, 1]
+        eta = ttt_lr * token_decay
+
         # ── RoPE (positions reset per mini-batch) ──
         cos = self.rope_cos[:K]                            # [K, dk//2]
         sin = self.rope_sin[:K]
         Q  = apply_rope(Q, cos, sin)
         XK = apply_rope(XK, cos, sin)
 
-        # ── scan over mini-batches ──
+        # ── scan over mini-batches, with optional multi-step inner optimization ──
+        num_inner_steps = self.config.num_inner_steps
         params = self.backbone.init_fast_weights(B, x.device)
         outputs = []
+        inner_losses = [[] for _ in range(num_inner_steps)]  # per-step inner losses
         for mb in range(num_mb):
-            result = self.backbone.compute_mini_batch(
-                params,
-                Q[:, :, mb],                               # [B, nh, K, dk]
-                XK[:, :, mb],
-                V[:, :, mb],
-                self.eta,
-            )
-            params = result.params
+            for step in range(num_inner_steps):
+                result = self.backbone.compute_mini_batch(
+                    params,
+                    Q[:, :, mb],                           # [B, nh, K, dk]
+                    XK[:, :, mb],
+                    V[:, :, mb],
+                    eta[:, :, mb],                         # [B, nh, K, 1]
+                )
+                # compute inner MSE: ||f(k) - v||^2 averaged over chunk
+                with torch.no_grad():
+                    inner_mse = (result.output - V[:, :, mb]).pow(2).mean()
+                    inner_losses[step].append(inner_mse)
+                params = result.params
             outputs.append(result.output)
 
         O = torch.stack(outputs, dim=2)                    # [B, nh, num_mb, K, dk]
         O = rearrange(O, 'b nh nm k dk -> b nh (nm k) dk')
         O = self.post_norm(O)
         O = rearrange(O, 'b nh l dk -> b l (nh dk)')
+
+        # average inner losses across mini-batches: [num_inner_steps]
+        self._inner_losses = [
+            torch.stack(step_losses).mean() for step_losses in inner_losses
+        ]
+
         return self.o_proj(O)
 
 

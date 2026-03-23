@@ -289,6 +289,14 @@ class TTTLitModel(L.LightningModule):
         loss, acc, _, _, _ = self._shared_step(batch)
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/acc", acc, prog_bar=True)
+
+        # log per-step inner losses from TTT layers
+        for block_idx, block in enumerate(self.model.blocks):
+            inner_losses = getattr(block.ttt, '_inner_losses', None)
+            if inner_losses:
+                for step_idx, il in enumerate(inner_losses):
+                    self.log(f"diagnostics/block{block_idx}_inner_loss_step{step_idx}", il)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -383,7 +391,7 @@ class TTTLitModel(L.LightningModule):
         queries = queries.view(1, N, nh, dk).permute(0, 2, 1, 3)
         values = values.view(1, N, nh, dk).permute(0, 2, 1, 3)
 
-        eta = layer.eta
+        eta = layer.base_lr
         params = backbone.init_fast_weights(1, device)
         all_masks = []
         for i in range(N):
